@@ -49,8 +49,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
       return statuses.values.every((status) => status.isGranted);
     } else if (Platform.isIOS) {
-        final status = await Permission.bluetooth.request();
-        return status.isGranted;
+        return true;
     }
     return false;
   }
