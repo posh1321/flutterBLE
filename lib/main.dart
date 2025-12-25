@@ -1,6 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
-
+import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_reactive_ble/flutter_reactive_ble.dart';
 import 'package:permission_handler/permission_handler.dart';
@@ -37,16 +37,22 @@ class _HomeScreenState extends State<HomeScreen> {
   final Uuid charUuid = Uuid.parse("abcd1234-5678-90ab-cdef-1234567890ab");
 
   Future<bool> _requestBlePermissions() async {
-    // Android 12+ (SDK 31+)
-    final permissions = [
-      Permission.bluetoothScan,
-      Permission.bluetoothConnect,
-      Permission.locationWhenInUse,
-    ];
+    if (Platform.isAndroid) {
+      // Android 12+ (SDK 31+)
+      final permissions = [
+        Permission.bluetoothScan,
+        Permission.bluetoothConnect,
+        Permission.locationWhenInUse,
+      ];
 
-    final statuses = await permissions.request();
+      final statuses = await permissions.request();
 
-    return statuses.values.every((status) => status.isGranted);
+      return statuses.values.every((status) => status.isGranted);
+    } else if (Platform.isIOS) {
+        final status = await Permission.bluetooth.request();
+        return status.isGranted;
+    }
+    return false;
   }
 
   void _scanDevices() async {
