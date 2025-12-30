@@ -28,17 +28,23 @@ class _HomeScreenState extends State<HomeScreen> {
   final _ble = FlutterReactiveBle();
   DiscoveredDevice? _device;
   bool _connected = false;
-  bool _turnOn = false;
-  late StreamSubscription<ConnectionStateUpdate> _connection;
-  bool _scanning = false;
 
-  // UUID of the service and characteristic to write ON/OFF
+  // Dugmad (stanje svakog LED-a)
+  List<bool> _turnOnStates = [false, false, false, false];
+
+  // Temperatura
+  double? _temperature;
+  Timer? _tempTimer;
+
+  late StreamSubscription<ConnectionStateUpdate> _connection;
+  StreamSubscription<List<int>>? _tempNotifySub;
+
+  // UUIDs
   final Uuid serviceUuid = Uuid.parse("12345678-1234-1234-1234-1234567890ab");
   final Uuid charUuid = Uuid.parse("abcd1234-5678-90ab-cdef-1234567890ab");
 
   Future<bool> _requestBlePermissions() async {
     if (Platform.isAndroid) {
-      // Android 12+ (SDK 31+)
       final permissions = [
         Permission.bluetoothScan,
         Permission.bluetoothConnect,
@@ -46,16 +52,13 @@ class _HomeScreenState extends State<HomeScreen> {
       ];
 
       final statuses = await permissions.request();
-
       return statuses.values.every((status) => status.isGranted);
-    } else if (Platform.isIOS) {
-        return true;
     }
-    return false;
+    return true; // iOS
   }
 
   void _scanDevices() async {
-    if (_scanning) return;
+    if (_device != null) return;
 
     final granted = await _requestBlePermissions();
     if (!granted) {
@@ -65,21 +68,13 @@ class _HomeScreenState extends State<HomeScreen> {
       return;
     }
 
-    setState(() => _scanning = true);
-
     List<DiscoveredDevice> devices = [];
-
     final subscription = _ble.scanForDevices(withServices: []).listen((device) {
-      if (!devices.any((d) => d.id == device.id)) {
-        devices.add(device);
-      }
+      if (!devices.any((d) => d.id == device.id)) devices.add(device);
     });
 
-    // Scan 5 sekundi
     await Future.delayed(Duration(seconds: 5));
     await subscription.cancel();
-
-    setState(() => _scanning = false);
 
     if (devices.isNotEmpty) {
       DiscoveredDevice? selected = await showDialog(
@@ -94,7 +89,7 @@ class _HomeScreenState extends State<HomeScreen> {
       );
 
       if (selected != null) {
-        setState(() => _device = selected);
+        _device = selected;
         _connect();
       }
     } else {
@@ -109,17 +104,19 @@ class _HomeScreenState extends State<HomeScreen> {
 
     _connection = _ble.connectToDevice(
       id: _device!.id,
-      connectionTimeout: const Duration(seconds: 5),
+      connectionTimeout: Duration(seconds: 5),
     ).listen((event) {
       if (event.connectionState == DeviceConnectionState.connected) {
-        setState(() {
-          _connected = true;
-        });
+        setState(() => _connected = true);
+        _subscribeToTempNotify();
+        _startTempTimer();
       } else if (event.connectionState == DeviceConnectionState.disconnected) {
         setState(() {
           _connected = false;
-          _turnOn = false;
           _device = null;
+          _turnOnStates = [false, false, false, false];
+          _tempTimer?.cancel();
+          _tempNotifySub?.cancel();
         });
       }
     });
@@ -127,32 +124,40 @@ class _HomeScreenState extends State<HomeScreen> {
 
   void _disconnect() async {
     await _connection.cancel();
+    _tempTimer?.cancel();
+    _tempNotifySub?.cancel();
     setState(() {
       _connected = false;
-      _turnOn = false;
       _device = null;
+      _turnOnStates = [false, false, false, false];
     });
   }
 
-  void _toggle() async {
+  void _sendCommand(int index) async {
     if (!_connected || _device == null) return;
 
-    final value = utf8.encode(_turnOn ? "OFF" : "ON");
+    // Odredi komandu prema trenutnom stanju dugmeta
+    String cmd;
+    if (_turnOnStates[index]) {
+      cmd = "OFF${index == 0 ? '' : index + 1}";
+    } else {
+      cmd = "ON${index == 0 ? '' : index + 1}";
+    }
 
     try {
-      await _ble.writeCharacteristicWithoutResponse(
+      await _ble.writeCharacteristicWithResponse(
         QualifiedCharacteristic(
           characteristicId: charUuid,
           serviceId: serviceUuid,
           deviceId: _device!.id,
         ),
-        value: value,
+        value: utf8.encode(cmd),
       );
 
+      // samo update UI ako komanda prođe
       setState(() {
-        _turnOn = !_turnOn;
+        _turnOnStates[index] = !_turnOnStates[index];
       });
-
     } catch (e) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text('Write failed: $e')),
@@ -160,97 +165,163 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+  void _subscribeToTempNotify() {
+    _tempNotifySub?.cancel();
+    if (_device == null) return;
+
+    _tempNotifySub = _ble.subscribeToCharacteristic(
+      QualifiedCharacteristic(
+        characteristicId: charUuid,
+        serviceId: serviceUuid,
+        deviceId: _device!.id,
+      ),
+    ).listen((data) {
+      final val = utf8.decode(data);
+      if (val.startsWith("TEMP:")) {
+        final tStr = val.substring(5);
+        double? t = tStr == "None" ? null : double.tryParse(tStr);
+        setState(() => _temperature = t);
+      }
+    });
+  }
+
+  void _startTempTimer() {
+    _tempTimer?.cancel();
+    _tempTimer = Timer.periodic(Duration(seconds: 10), (_) async {
+      if (!_connected || _device == null) return;
+
+      try {
+        await _ble.writeCharacteristicWithResponse(
+          QualifiedCharacteristic(
+            characteristicId: charUuid,
+            serviceId: serviceUuid,
+            deviceId: _device!.id,
+          ),
+          value: utf8.encode("TEMP?"),
+        );
+      } catch (e) {
+        print("TEMP read failed: $e");
+      }
+    });
+  }
+
   @override
   void dispose() {
+    _tempTimer?.cancel();
+    _tempNotifySub?.cancel();
     if (_connected) _connection.cancel();
     super.dispose();
+  }
+
+  Widget _buildTempCard() {
+    return Container(
+      width: 260,
+      height: 100,
+      margin: const EdgeInsets.symmetric(vertical: 20),
+      decoration: BoxDecoration(
+        color: Colors.grey[200],
+        borderRadius: BorderRadius.circular(16),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black12,
+            blurRadius: 6,
+            offset: Offset(0, 3),
+          ),
+        ],
+      ),
+      child: Center(
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          crossAxisAlignment: CrossAxisAlignment.center,
+          children: [
+            Icon(Icons.thermostat_rounded, size: 40, color: Colors.redAccent),
+            const SizedBox(width: 10),
+            Text(
+              _temperature != null
+                  ? "${_temperature!.toStringAsFixed(1)} °C"
+                  : "--.- °C",
+              style: const TextStyle(
+                fontSize: 36,
+                fontWeight: FontWeight.bold,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        backgroundColor: Colors.blue,
-        title: const Text(
-          'Smart Home',
-          style: TextStyle(color: Colors.white),
+        title: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: const [
+            Text("SmartHome"),
+            Text("ver 1.1"),
+          ],
         ),
-        actions: const [
-          Padding(
-            padding: EdgeInsets.all(8.0),
-            child: Center(
-              child: Text(
-                'ver 1.0',
-                style: TextStyle(color: Colors.white, fontSize: 16),
-              ),
-            ),
-          ),
-        ],
       ),
       body: Center(
-        child: Column(
-          mainAxisAlignment: MainAxisAlignment.start,
-          children: [
-            const SizedBox(height: 40),
+        child: SingleChildScrollView(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.start,
+            children: [
+              const SizedBox(height: 20),
 
-            // SCAN / DISCONNECT DUGME
-            SizedBox(
-              width: 260,
-              height: 55,
-              child: ElevatedButton(
-                onPressed: _connected ? _disconnect : _scanDevices,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: _connected ? Colors.red : Colors.blue,
-                  foregroundColor: Colors.white,
-                  textStyle: const TextStyle(fontSize: 18),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
+              // SCAN / DISCONNECT dugme veće
+              SizedBox(
+                width: 300,
+                height: 65,
+                child: ElevatedButton(
+                  onPressed: _connected ? _disconnect : _scanDevices,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _connected ? Colors.red : Colors.blue,
+                    foregroundColor: Colors.white,
+                    textStyle: const TextStyle(fontSize: 20),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
                   ),
-                ),
-                child: Text(_connected ? 'Disconnect' : 'Scan Devices'),
-              ),
-            ),
-
-            const SizedBox(height: 200),
-
-            // TURN ON / OFF DUGME
-            SizedBox(
-              width: 260,
-              height: 55,
-              child: ElevatedButton(
-                onPressed: _connected ? _toggle : null,
-                style: ElevatedButton.styleFrom(
-                  backgroundColor: _turnOn ? Colors.red : Colors.green,
-                  foregroundColor: Colors.white,
-                  textStyle: const TextStyle(fontSize: 18),
-                  shape: RoundedRectangleBorder(
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                ),
-                child: Text(_turnOn ? 'Turn Off' : 'Turn On'),
-              ),
-            ),
-
-            const SizedBox(height: 30),
-
-            if (_device != null)
-              Text(
-                'Device: ${_device!.name.isEmpty ? "Unknown" : _device!.name}',
-                textAlign: TextAlign.center,
-              ),
-
-            if (_connected)
-              const Padding(
-                padding: EdgeInsets.only(top: 10),
-                child: Text(
-                  'Connected!',
-                  style: TextStyle(
-                    color: Colors.green,
-                    fontWeight: FontWeight.bold,
-                  ),
+                  child: Text(_connected ? 'Disconnect' : 'Scan Devices'),
                 ),
               ),
-          ],
+
+              // temperatura card
+              _buildTempCard(),
+
+              const SizedBox(height: 10),
+
+              // 4 dugmeta Turn On/Off
+              for (int i = 0; i < 4; i++) ...[
+                SizedBox(
+                  width: 260,
+                  height: 55,
+                  child: ElevatedButton(
+                    onPressed: _connected ? () => _sendCommand(i) : null,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor:
+                      _turnOnStates[i] ? Colors.red : Colors.green,
+                      foregroundColor: Colors.white,
+                      textStyle: const TextStyle(fontSize: 18),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(12),
+                      ),
+                    ),
+                    child: Text(_turnOnStates[i] ? 'Turn Off' : 'Turn On'),
+                  ),
+                ),
+                const SizedBox(height: 15),
+              ],
+
+              if (_device != null)
+                Text(
+                  'Device: ${_device!.name.isEmpty ? "Unknown" : _device!.name}',
+                  textAlign: TextAlign.center,
+                ),
+            ],
+          ),
         ),
       ),
     );
